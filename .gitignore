@@ -1,0 +1,24 @@
+# Python cache
+__pycache__/
+
+# GitHub, OpenCode and VS Code
+.github/
+!.github/**/
+.opencode/
+.vscode/
+
+# Environment
+.env
+
+# Build and Debug
+build/
+debug/
+dist/
+mcp_server.spec
+mcp_server.log
+
+# Config files
+config/*.json
+
+# uv
+uv.lock

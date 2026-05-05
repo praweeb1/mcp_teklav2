@@ -1,0 +1,488 @@
+"""
+Module for utility functions used for geometry manipulations.
+"""
+
+from __future__ import annotations
+
+import re
+from functools import wraps, lru_cache
+from typing import Any
+from collections.abc import Callable
+from pathlib import Path
+
+
+from tekla_mcp_server.config import get_config, get_tolerance
+from tekla_mcp_server.init import logger
+from tekla_mcp_server.models import StringMatchType, NumericMatchType, BaseComponent
+
+from tekla_mcp_server.tekla.loader import (
+    StringOperatorType,
+    NumericOperatorType,
+    Point,
+    Vector,
+    ModelObject,
+    ModelObjectEnumerator,
+    Beam,
+    TransformationPlane,
+    ComponentInput,
+    Component,
+    Detail,
+    Seam,
+    PositionTypeEnum,
+    AutoDirectionTypeEnum,
+    DetailTypeEnum,
+    ViewHandler,
+    View,
+    TeklaStructuresInfo,
+    List,
+    CatalogHandler,
+    ProfileItem,
+    MaterialItem,
+    TeklaStructuresSettings,
+    BooleanPart,
+)
+
+from tekla_mcp_server.utils import log_function_call
+
+
+# Mappings
+# String match types
+STRING_MATCH_TYPE_MAPPING = {
+    StringMatchType.IS_EQUAL: StringOperatorType.IS_EQUAL,
+    StringMatchType.IS_NOT_EQUAL: StringOperatorType.IS_NOT_EQUAL,
+    StringMatchType.CONTAINS: StringOperatorType.CONTAINS,
+    StringMatchType.NOT_CONTAINS: StringOperatorType.NOT_CONTAINS,
+    StringMatchType.STARTS_WITH: StringOperatorType.STARTS_WITH,
+    StringMatchType.NOT_STARTS_WITH: StringOperatorType.NOT_STARTS_WITH,
+    StringMatchType.ENDS_WITH: StringOperatorType.ENDS_WITH,
+    StringMatchType.NOT_ENDS_WITH: StringOperatorType.NOT_ENDS_WITH,
+}
+
+NUMERIC_MATCH_TYPE_MAPPING = {
+    NumericMatchType.IS_EQUAL: NumericOperatorType.IS_EQUAL,
+    NumericMatchType.IS_NOT_EQUAL: NumericOperatorType.IS_NOT_EQUAL,
+    NumericMatchType.SMALLER_THAN: NumericOperatorType.SMALLER_THAN,
+    NumericMatchType.SMALLER_OR_EQUAL: NumericOperatorType.SMALLER_OR_EQUAL,
+    NumericMatchType.GREATER_THAN: NumericOperatorType.GREATER_THAN,
+    NumericMatchType.GREATER_OR_EQUAL: NumericOperatorType.GREATER_OR_EQUAL,
+}
+
+
+from tekla_mcp_server.tekla.wrappers.model import TeklaModel
+from tekla_mcp_server.tekla.wrappers.model_object import TeklaAssembly, TeklaPart, wrap_model_objects
+
+
+def ensure_transformation_plane(func: Callable[..., Any]) -> Callable[..., Any]:
+    """
+    Decorator that sets the transformation plane before execution and restores it after.
+
+    Args:
+        func: The function to decorate
+
+    Returns:
+        Wrapped function that handles transformation plane context
+    """
+
+    @wraps(func)
+    def wrapper(model: TeklaModel, component: Any, *args: Any, **kwargs: Any) -> Any:
+        # Determine the number of objects in args
+        selected_object = args[0]  # Supports only the first element
+
+        current_plane = model.model.GetWorkPlaneHandler().GetCurrentTransformationPlane()
+        local_plane = TransformationPlane(selected_object.GetCoordinateSystem())
+
+        try:
+            model.model.GetWorkPlaneHandler().SetCurrentTransformationPlane(local_plane)
+            # Call the actual function
+            result = func(model, component, *args, **kwargs)
+        finally:
+            # Reset transformation plane after execution
+            model.model.GetWorkPlaneHandler().SetCurrentTransformationPlane(current_plane)
+
+        return result
+
+    return wrapper
+
+
+def insert_detail(selected_object: ModelObject, component: BaseComponent, point: Point, reverse: bool = False) -> bool:
+    """
+    Inserts a custom detail component into a Tekla model at a specified point.
+
+    Args:
+        selected_object: The primary object to attach the detail to
+        component: The component to insert
+        point: The reference point for the detail
+        reverse: If True, inserts detail in reverse direction (default False)
+
+    Returns:
+        True if insertion was successful, False otherwise
+    """
+    d = Detail()
+    d.Name = component.name
+    d.Number = component.number
+    d.LoadAttributesFromFile(component.properties_set)
+    d.UpVector = Vector(0, 0, 0)
+    d.PositionType = PositionTypeEnum.MIDDLE_PLANE
+    d.AutoDirectionType = AutoDirectionTypeEnum.AUTODIR_DETAIL
+    d.DetailType = DetailTypeEnum.INTERMEDIATE_REVERSE if reverse else DetailTypeEnum.INTERMEDIATE
+    d.SetPrimaryObject(selected_object)
+    if component.properties:
+        for key, value in component.properties.items():
+            d.SetAttribute(key, value)
+    d.SetReferencePoint(point)
+
+    return d.Insert()
+
+
+def insert_seam(primary_object: ModelObject, secondary_object: ModelObject, component: BaseComponent, point1: Point, point2: Point) -> bool:
+    """
+    Inserts a custom seam component into a Tekla model.
+
+    Args:
+        primary_object: The primary object for the seam
+        secondary_object: The secondary object for the seam
+        component: The component to insert
+        point1: First input position
+        point2: Second input position
+
+    Returns:
+        True if insertion was successful, False otherwise
+    """
+    s = Seam()
+    s.Name = component.name
+    s.Number = component.number
+    s.LoadAttributesFromFile(component.properties_set)
+    s.UpVector = Vector(0, 0, 0)
+    s.AutoDirectionType = AutoDirectionTypeEnum.AUTODIR_DETAIL
+    s.AutoPosition = True
+
+    s.SetPrimaryObject(primary_object)
+    s.SetSecondaryObject(secondary_object)
+    if component.properties:
+        for key, value in component.properties.items():
+            s.SetAttribute(key, value)
+    s.SetInputPositions(point1, point2)
+
+    return s.Insert()
+
+
+def insert_component(selected_object: ModelObject, component: BaseComponent) -> bool:
+    """
+    Inserts a component into a Tekla model to the specified object.
+
+    Args:
+        selected_object: The object to attach the component to
+        component: The component to insert
+
+    Returns:
+        True if insertion was successful, False otherwise
+    """
+    c = Component()
+    c.Name = component.name
+    c.Number = component.number
+    c.LoadAttributesFromFile(component.properties_set)
+    if component.properties:
+        for key, value in component.properties.items():
+            c.SetAttribute(key, value)
+    ci = ComponentInput()
+    ci.AddInputObject(selected_object)
+    c.SetComponentInput(ci)
+    return c.Insert()
+
+
+@log_function_call
+def get_wall_pairs(selected_objects: ModelObjectEnumerator) -> list[tuple[ModelObject, ModelObject]]:
+    """
+    Identifies and pairs walls based on their (X, Y) coordinates and Z-levels within a specified tolerance.
+
+    The function filters out non-wall objects, validates that there are exactly two floors,
+    sorts the walls based on (X, Y, Z) coordinates, and pairs walls into (bottom_wall, top_wall)
+    if their X and Y coordinates match within precision.
+
+    Args:
+        selected_objects: Enumerator of selected model objects (Beams expected)
+
+    Returns:
+        List of tuples containing (bottom_wall, top_wall) pairs
+
+    Raises:
+        ValueError: If fewer than two elements are selected
+        ValueError: If more than two floors are detected
+    """
+
+    def is_within_tolerance(value1: float, value2: float, tolerance: float | None = None) -> bool:
+        """
+        Check if two values are within the defined tolerance range.
+
+        Args:
+            value1: First value to compare
+            value2: Second value to compare
+            tolerance: Maximum allowed difference
+
+        Returns:
+            True if absolute difference <= tolerance, False otherwise
+        """
+        if tolerance is None:
+            tolerance = get_tolerance("wall_pairing")
+        return abs(value1 - value2) <= tolerance
+
+    selected_walls = []
+    for selected_object in selected_objects:
+        if isinstance(selected_object, Beam):
+            selected_walls.append(selected_object)
+
+    if len(selected_walls) < 2:
+        raise ValueError("Less than two elements selected. Please select two elements.")
+
+    # Step 1. Validate number of floors
+    floor_set: set[float] = set()
+    for wall in selected_walls:
+        if round(wall.StartPoint.Z, 2) != round(wall.EndPoint.Z, 2):
+            raise ValueError(f"Z-coordinate mismatch for the start point and end point in the wall {wall.Name}.")
+
+        # Check if this Z-value is close to an existing one
+        close_match_found = False
+        for existing_z in floor_set:
+            if is_within_tolerance(existing_z, wall.StartPoint.Z):
+                # No need to check further
+                close_match_found = True
+                break
+
+        # Add Z only if no close match is found
+        if not close_match_found:
+            floor_set.add(wall.StartPoint.Z)
+
+    if len(floor_set) > 2:
+        raise ValueError("More than two floors detected.")
+
+    # Step 2. Sort walls by (X, Y) and Z-coordinates
+    selected_walls.sort(key=lambda w: (w.StartPoint.X, w.StartPoint.Y, w.StartPoint.Z))
+
+    # Step 3. Pair bottom_wall with top_wall
+    wall_pairs: Any = []
+    wall_dict: Any = {}
+
+    for wall in selected_walls:
+        xy_key = ((round(wall.StartPoint.X, 2), round(wall.StartPoint.Y, 2)), (round(wall.EndPoint.X, 2), round(wall.EndPoint.Y, 2)))
+
+        # Find a matching wall within allowed tolerance
+        matched_key = None
+        for key in wall_dict:
+            if (
+                is_within_tolerance(xy_key[0][0], key[0][0])
+                and is_within_tolerance(xy_key[0][1], key[0][1])
+                and is_within_tolerance(xy_key[1][0], key[1][0])
+                and is_within_tolerance(xy_key[1][1], key[1][1])
+            ):
+                matched_key = key
+                break
+
+        if matched_key:
+            bottom_wall = wall_dict[matched_key]
+            top_wall = wall
+
+            # Ensure correct pairing before adding
+            if bottom_wall != top_wall:
+                # List of tuples as output
+                wall_pairs.append((bottom_wall, top_wall))
+                del wall_dict[matched_key]  # Remove matched pair from storage
+        else:
+            wall_dict[xy_key] = wall  # Store as potential bottom wall
+
+    logger.debug("Wall pairs identified: %s", wall_pairs)
+    return wall_pairs
+
+
+def get_tekla_major_version() -> int:
+    """
+    Get the Tekla Structures major version from the current program version.
+
+    Returns:
+        Major version number (e.g., 2022, 2024).
+        Defaults to 2022 if parsing fails.
+    """
+    version = TeklaStructuresInfo.GetCurrentProgramVersion()
+    match = re.match(r"(\d{4})", version)
+    if match:
+        return int(match.group(1))
+    return 2022
+
+
+def get_active_views() -> list[View]:
+    """
+    Get the currently active views in the model.
+
+    Uses ViewHandler.GetActiveView() for Tekla 2024+,
+    falls back to ViewHandler.GetVisibleViews() for earlier versions.
+
+    Returns:
+        List of View objects that are currently active/visible
+    """
+    views: list[View] = []
+
+    if get_tekla_major_version() >= 2024:
+        active_view = ViewHandler.GetActiveView()
+        if active_view is not None:
+            views.append(active_view)
+    else:
+        view_enum = ViewHandler.GetVisibleViews()
+        while view_enum.MoveNext():
+            views.append(view_enum.Current)
+
+    return views
+
+
+def collect_children(selected_objects: ModelObjectEnumerator) -> List[ModelObject]:
+    """
+    Collect child objects from selected parts/assemblies into a Tekla List.
+
+    Args:
+        selected_objects: Enumerator of selected objects
+
+    Returns:
+        List of ModelObjects containing all children from assemblies and parts
+    """
+    children: list[ModelObject] = []
+    for obj in wrap_model_objects(selected_objects):
+        if isinstance(obj, TeklaAssembly):
+            children.extend(obj.get_all_children())
+        elif isinstance(obj, TeklaPart):
+            children.extend(obj.get_all_children(include_all=False))
+
+    tekla_list = List[ModelObject]()
+    for child in children:
+        tekla_list.Add(child)
+    return tekla_list
+
+
+def iterate_boolean_parts(model_object: ModelObject) -> list[ModelObject]:
+    """
+    Iterate over boolean parts attached to a model object.
+
+    Args:
+        model_object: The Tekla model object to get booleans from
+
+    Returns:
+        List of BooleanPart objects attached to the model object
+    """
+    boolean_parts: list[ModelObject] = []
+    boolean_enum = model_object.GetBooleans()
+    while boolean_enum.MoveNext():
+        if isinstance(boolean_enum.Current, BooleanPart):
+            boolean_parts.append(boolean_enum.Current)
+    return boolean_parts
+
+
+@lru_cache
+def get_all_profiles() -> list[dict[str, str]]:
+    """
+    Get all profiles from Tekla catalog. Lazy loaded on first access.
+    """
+    catalog = CatalogHandler()
+    if not catalog.GetConnectionStatus():
+        return []
+    profiles = catalog.GetLibraryProfileItems()
+    result = []
+    while profiles.MoveNext():
+        prof = profiles.Current
+        if isinstance(prof, ProfileItem):
+            prof_type = getattr(prof, "ProfileItemType", None)
+            prof_subtype = getattr(prof, "ProfileItemSubType", None)
+            result.append(
+                {
+                    "name": prof.ProfileName,
+                    "type": prof_type.ToString() if prof_type else "UNKNOWN",
+                    "sub_type": prof_subtype.ToString() if prof_subtype else "UNKNOWN",
+                }
+            )
+    return result
+
+
+@lru_cache
+def get_all_materials() -> list[dict[str, str]]:
+    """
+    Get all materials from Tekla catalog. Lazy loaded on first access.
+    """
+    catalog = CatalogHandler()
+    if not catalog.GetConnectionStatus():
+        return []
+    materials = catalog.GetMaterialItems()
+    result = []
+    while materials.MoveNext():
+        mat = materials.Current
+        if isinstance(mat, MaterialItem):
+            mat_type = getattr(mat, "Type", None)
+            result.append(
+                {
+                    "name": mat.MaterialName,
+                    "type": mat_type.ToString() if mat_type else "UNKNOWN",
+                }
+            )
+    return result
+
+
+@lru_cache
+def get_macros() -> list[str]:
+    """
+    Returns sorted list of available Tekla macros.
+    Searches in XS_MACRO_DIRECTORY.
+    """
+
+    directories = get_config().tekla_macro_directories
+    macro_names: list[str] = []
+
+    for directory in directories:
+        dir_path = Path(directory)
+        if dir_path.is_dir():
+            for file in dir_path.rglob("*.cs"):
+                macro_names.append(file.name)
+
+    return sorted(macro_names)
+
+
+@lru_cache
+def get_filters(file_extension: str) -> list[str]:
+    """
+    Returns list of available Tekla filter names from files with the specified extension.
+
+    Searches in:
+    - XS_FIRM
+    - XS_PROJECT
+    - ModelPath/attributes directory
+
+    Args:
+        file_extension: File extension to search for (e.g., ".SObjGrp", ".VObjGrp")
+
+    Returns sorted list of filter names without the extension.
+    """
+
+    if not file_extension.startswith("."):
+        file_extension = f".{file_extension}"
+
+    paths: list[Path] = []
+
+    for option_name in ("XS_FIRM", "XS_PROJECT"):
+        _, option = TeklaStructuresSettings.GetAdvancedOption(option_name, str())
+        if not option:
+            continue
+        for path_str in option.split(";"):
+            path = Path(path_str.strip())
+            if path.is_dir():
+                paths.append(path.resolve())
+
+    try:
+        model = TeklaModel()
+        model_path = model.model.GetInfo().ModelPath
+        if model_path:
+            attributes_dir = Path(model_path) / "attributes"
+            if attributes_dir.is_dir():
+                paths.append(attributes_dir.resolve())
+    except Exception:
+        pass
+
+    filter_names: set[str] = {"standard"}
+    for dir_path in paths:
+        for file in dir_path.rglob(f"*{file_extension}"):
+            filter_names.add(file.stem)
+
+    return sorted(filter_names)
